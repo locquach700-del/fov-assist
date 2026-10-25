@@ -46,13 +46,19 @@ class OverlayService : Service() {
             .build()
     }
 
+    private fun overlayType(): Int {
+        return if (Build.VERSION.SDK_INT >= 26)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else
+            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+    }
+
     private fun showFov() {
         val v = FovView(this)
         val p = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
-            if (Build.VERSION.SDK_INT >= 26) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
+            overlayType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
@@ -126,7 +132,17 @@ class OverlayService : Service() {
         val autoTapToggle = ToggleButton(ctx).apply {
             textOn = "Auto Tap: ON"; textOff = "Auto Tap: OFF"
             setOnCheckedChangeListener { _, checked ->
-                if (checked) startAutoTap() else stopAutoTap()
+                if (checked) {
+                    val ok = ensureShizuku()
+                    if (!ok) {
+                        isChecked = false
+                        Toast.makeText(ctx, "Chưa cấp quyền Shizuku", Toast.LENGTH_SHORT).show()
+                    } else {
+                        startAutoTap()
+                    }
+                } else {
+                    stopAutoTap()
+                }
             }
         }
         root.addView(autoTapToggle)
@@ -159,8 +175,7 @@ class OverlayService : Service() {
         val p = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
-            if (Build.VERSION.SDK_INT >= 26) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
+            overlayType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         )
@@ -172,10 +187,31 @@ class OverlayService : Service() {
         var dx = 0; var dy = 0
         header.setOnTouchListener { _, e ->
             when (e.action) {
-                MotionEvent.ACTION_DOWN -> { dx = e.rawX.toInt() - p.x; dy = e.rawY.toInt() - p.y; true }
-                MotionEvent.ACTION_MOVE -> { p.x = e.rawX.toInt() - dx; p.y = e.rawY.toInt() - dy; wm.updateViewLayout(root, p); true }
+                MotionEvent.ACTION_DOWN -> {
+                    dx = e.rawX.toInt() - p.x
+                    dy = e.rawY.toInt() - p.y
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    p.x = e.rawX.toInt() - dx
+                    p.y = e.rawY.toInt() - dy
+                    wm.updateViewLayout(root, p)
+                    true
+                }
                 else -> false
             }
+        }
+    }
+
+    private fun ensureShizuku(): Boolean {
+        return try {
+            if (Shizuku.isPreV11()) return false
+            if (Shizuku.checkSelfPermission() == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                return true
+            }
+            false
+        } catch (_: Throwable) {
+            false
         }
     }
 
@@ -183,17 +219,11 @@ class OverlayService : Service() {
         if (autoTapOn) return
         autoTapOn = true
         autoTapThread = Thread {
+            val dm = resources.displayMetrics
+            val cx = dm.widthPixels / 2
+            val cy = dm.heightPixels / 2
             while (autoTapOn) {
-                val dm = resources.displayMetrics
-                val cx = dm.widthPixels / 2
-                val cy = dm.heightPixels / 2
-                try {
-                    val p = Shizuku.newProcess(
-                        arrayOf("input", "tap", cx.toString(), cy.toString()),
-                        null, null
-                    )
-                    p.waitFor()
-                } catch (e: Throwable) { }
+                shizukuExec("input", "tap", cx.toString(), cy.toString())
                 try { Thread.sleep(tapDelayMs) } catch (_: InterruptedException) { break }
             }
         }.also { it.start() }
@@ -203,6 +233,33 @@ class OverlayService : Service() {
         autoTapOn = false
         autoTapThread?.interrupt()
         autoTapThread = null
+    }
+
+    private fun shizukuExec(vararg cmd: String): Boolean {
+        // Reflection vào Shizuku.newProcess (private)
+        try {
+            val clazz = Class.forName("rikka.shizuku.Shizuku")
+            val method = clazz.getDeclaredMethod(
+                "newProcess",
+                Array<String>::class.java,
+                Array<String>::class.java,
+                String::class.java
+            )
+            method.isAccessible = true
+            val cmdArr: Array<String> = cmd.toList().toTypedArray()
+            val proc = method.invoke(null, cmdArr, null, null) as? Process
+            proc?.waitFor()
+            return proc != null
+        } catch (_: Throwable) {
+            // Fallback Runtime.exec
+            return try {
+                val p = Runtime.getRuntime().exec(cmd.toList().toTypedArray())
+                p.waitFor()
+                true
+            } catch (_: Throwable) {
+                false
+            }
+        }
     }
 
     override fun onDestroy() {
@@ -217,6 +274,7 @@ class FovView(ctx: Context) : View(ctx) {
     var radius = 200f
     var visible = true
     var crosshair = true
+
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeWidth = 4f

@@ -13,7 +13,7 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Setup Android SDK (manual)
+      - name: Setup Android SDK
         run: |
           export ANDROID_HOME=$HOME/android-sdk
           mkdir -p $ANDROID_HOME/cmdline-tools
@@ -25,30 +25,50 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
 
-      - name: Install SDK packages
+      - name: Install packages
         run: |
           yes | sdkmanager --licenses || true
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
-      - name: Fix aapt2 + gradle.properties
+      - name: Create missing resources
+        run: |
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">FOV Assist</string>
+          </resources>
+          EOF
+
+      - name: Fix manifest icon
+        run: |
+          sed -i 's|android:label="FOV Assist"|android:label="FOV Assist"\n        android:icon="@android:drawable/sym_def_app_icon"|' app/src/main/AndroidManifest.xml
+
+      - name: Fix build.gradle
+        run: |
+          sed -i '/compileSdk 34/a\    buildToolsVersion "34.0.0"' app/build.gradle
+
+      - name: Fix aapt2
         run: |
           chmod +x $ANDROID_HOME/build-tools/34.0.0/aapt2
           mkdir -p ~/.gradle
-          cat >> ~/.gradle/gradle.properties << 'EOF'
-          android.aapt2FromMavenOverride=PLACEHOLDER_AAPT2
-          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
-          EOF
-          sed -i "s|PLACEHOLDER_AAPT2|$ANDROID_HOME/build-tools/34.0.0/aapt2|" ~/.gradle/gradle.properties
-          cat ~/.gradle/gradle.properties
+          echo "android.aapt2FromMavenOverride=$ANDROID_HOME/build-tools/34.0.0/aapt2" >> ~/.gradle/gradle.properties
+          echo "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8" >> ~/.gradle/gradle.properties
 
-      - name: Create local.properties
+      - name: local.properties
         run: echo "sdk.dir=$ANDROID_HOME" > local.properties
 
-      - name: Grant execute
+      - name: Gradlew exec
         run: chmod +x gradlew
 
-      - name: Build Debug APK
-        run: ./gradlew assembleDebug --no-daemon --stacktrace --info
+      - name: Build
+        run: ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: Show errors if fail
+        if: failure()
+        run: |
+          echo "=== ERRORS ==="
+          grep -A 20 -i "FAILURE\|What went wrong\|Caused by\|error:" build.log | head -100 || true
 
       - uses: actions/upload-artifact@v4
         if: success()

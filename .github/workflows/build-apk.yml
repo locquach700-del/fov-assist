@@ -30,6 +30,18 @@ jobs:
           yes | sdkmanager --licenses || true
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
+      - name: Create gradle.properties
+        run: |
+          cat > gradle.properties << 'EOF'
+          android.useAndroidX=true
+          android.enableJetifier=true
+          android.nonTransitiveRClass=true
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          kotlin.code.style=official
+          EOF
+
       - name: Create missing resources
         run: |
           mkdir -p app/src/main/res/values
@@ -51,9 +63,7 @@ jobs:
       - name: Fix aapt2
         run: |
           chmod +x $ANDROID_HOME/build-tools/34.0.0/aapt2
-          mkdir -p ~/.gradle
-          echo "android.aapt2FromMavenOverride=$ANDROID_HOME/build-tools/34.0.0/aapt2" >> ~/.gradle/gradle.properties
-          echo "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8" >> ~/.gradle/gradle.properties
+          echo "android.aapt2FromMavenOverride=$ANDROID_HOME/build-tools/34.0.0/aapt2" >> gradle.properties
 
       - name: local.properties
         run: echo "sdk.dir=$ANDROID_HOME" > local.properties
@@ -61,46 +71,32 @@ jobs:
       - name: Gradlew exec
         run: chmod +x gradlew
 
-      - name: Clean build
+      - name: Clean
         run: ./gradlew clean --no-daemon
 
-      - name: Build APK
-        id: build_step
+      - name: Build
+        id: build
         run: |
           set -o pipefail
-          ./gradlew assembleDebug --no-daemon --stacktrace --info 2>&1 | tee build.log
-          echo "BUILD_EXIT=$?"
-
-      - name: Find APK files
-        if: always()
-        run: |
-          echo "=== Searching for APK files ==="
-          find . -name "*.apk" -type f 2>/dev/null
-          echo "=== End search ==="
-          echo "=== Check standard paths ==="
-          ls -la app/build/outputs/apk/debug/ 2>/dev/null || echo "debug dir not found"
-          ls -la app/build/outputs/apk/ 2>/dev/null || echo "apk dir not found"
-          ls -la app/build/outputs/ 2>/dev/null || echo "outputs dir not found"
-
-      - name: Show build log tail
-        if: always()
-        run: |
-          echo "=== Last 100 lines of build log ==="
-          tail -100 build.log || true
+          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
 
       - name: Show errors
         if: failure()
         run: |
           echo "=== ERRORS ==="
-          grep -B 2 -A 20 -i "FAILURE\|What went wrong\|Caused by\|error:\|Execution failed" build.log | head -200 || true
+          grep -B 2 -A 30 -i "FAILURE\|What went wrong\|Caused by\|error:\|Execution failed" build.log | head -200 || true
 
-      - name: Upload any APK
+      - name: Find APK
         if: always()
-        uses: actions/upload-artifact@v4
+        run: |
+          echo "=== APK files ==="
+          find . -name "*.apk" -type f 2>/dev/null || echo "none"
+          ls -la app/build/outputs/apk/debug/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: success()
         with:
-          name: apk-files
+          name: app-debug
           path: |
             app/build/outputs/apk/**/*.apk
             **/*.apk
-          if-no-files-found: warn
-          retention-days: 7

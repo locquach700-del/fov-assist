@@ -24,6 +24,8 @@ class MainActivity : Activity() {
     private val REQ_SHIZUKU = 200
     private val REQ_MEDIA_PROJ = 300
 
+    private var pendingLaunchPkg: String? = null
+
     companion object {
         const val PREFS = "fov_prefs"
         const val KEY_TARGET_PKG = "target_pkg"
@@ -67,7 +69,7 @@ class MainActivity : Activity() {
             text = "1. Cấp Overlay\n" +
                    "2. Cấp Shizuku\n" +
                    "3. Chọn app đích\n" +
-                   "4. Cấp quyền Screen Capture\n" +
+                   "4. Cấp quyền Screen Capture (test)\n" +
                    "5. Bật Overlay + Vào game"
             textSize = 13f
             setTextColor(Color.parseColor("#AAAAAA"))
@@ -77,7 +79,10 @@ class MainActivity : Activity() {
         root.addView(btn("1. Overlay") { requestOverlay() })
         root.addView(btn("2. Shizuku") { requestShizuku() })
         root.addView(btn("3. Chọn app đích") { pickApp { refreshTarget() } })
-        root.addView(btn("4. Cấp quyền Screen Capture") { requestMediaProjection() })
+        root.addView(btn("4. Cấp Screen Capture (test)") {
+            val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            startActivityForResult(mgr.createScreenCaptureIntent(), REQ_MEDIA_PROJ)
+        })
         root.addView(btn("5. Bật Overlay + Vào game") { startOverlayAndLaunch() })
         root.addView(btn("Tắt Overlay") { stopOverlay() })
 
@@ -116,29 +121,21 @@ class MainActivity : Activity() {
 
     private fun requestShizuku() {
         try {
-            if (Shizuku.isPreV11()) { Toast.makeText(this, "Shizuku cũ", Toast.LENGTH_SHORT).show(); return }
-            if (!Shizuku.pingBinder()) { Toast.makeText(this, "Mở Shizuku trước", Toast.LENGTH_LONG).show(); return }
+            if (Shizuku.isPreV11()) {
+                Toast.makeText(this, "Shizuku cũ", Toast.LENGTH_SHORT).show()
+                return
+            }
+            if (!Shizuku.pingBinder()) {
+                Toast.makeText(this, "Mở Shizuku app trước", Toast.LENGTH_LONG).show()
+                return
+            }
             if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
-                Toast.makeText(this, "Đã có Shizuku", Toast.LENGTH_SHORT).show(); return
+                Toast.makeText(this, "Đã có Shizuku", Toast.LENGTH_SHORT).show()
+                return
             }
             Shizuku.requestPermission(REQ_SHIZUKU)
         } catch (e: Throwable) {
             Toast.makeText(this, "Shizuku: ${e.message}", Toast.LENGTH_LONG).show()
-        }
-    }
-
-    private fun requestMediaProjection() {
-        val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        startActivityForResult(mgr.createScreenCaptureIntent(), REQ_MEDIA_PROJ)
-    }
-
-    override fun onActivityResult(req: Int, res: Int, data: Intent?) {
-        super.onActivityResult(req, res, data)
-        if (req == REQ_MEDIA_PROJ && res == RESULT_OK && data != null) {
-            val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
-            prefs.edit().putInt("proj_result", res).apply()
-            // Không lưu intent trực tiếp (Parcelable) — chỉ lưu khi bật
-            Toast.makeText(this, "Đã cấp quyền Screen Capture", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -148,7 +145,10 @@ class MainActivity : Activity() {
         val list = pm.queryIntentActivities(main, 0)
             .filter { it.activityInfo.packageName != packageName }
             .sortedBy { it.loadLabel(pm).toString().lowercase() }
-        if (list.isEmpty()) { Toast.makeText(this, "Không có app", Toast.LENGTH_SHORT).show(); return }
+        if (list.isEmpty()) {
+            Toast.makeText(this, "Không có app", Toast.LENGTH_SHORT).show()
+            return
+        }
         val names = list.map { "${it.loadLabel(pm)}  (${it.activityInfo.packageName})" }.toTypedArray()
         AlertDialog.Builder(this)
             .setTitle("Chọn app đích")
@@ -167,35 +167,52 @@ class MainActivity : Activity() {
     private fun startOverlayAndLaunch() {
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         val pkg = prefs.getString(KEY_TARGET_PKG, null)
-        if (pkg == null) { Toast.makeText(this, "Chưa chọn app", Toast.LENGTH_SHORT).show(); return }
-        if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, "Chưa cấp Overlay", Toast.LENGTH_SHORT).show(); return
+        if (pkg == null) {
+            Toast.makeText(this, "Chưa chọn app", Toast.LENGTH_SHORT).show()
+            return
         }
-        // Yêu cầu MediaProjection mỗi lần bật — không cache được
+        if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
+            Toast.makeText(this, "Chưa cấp Overlay", Toast.LENGTH_SHORT).show()
+            return
+        }
+        pendingLaunchPkg = pkg
         val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         startActivityForResult(mgr.createScreenCaptureIntent(), REQ_MEDIA_PROJ)
-        pendingLaunchPkg = pkg
     }
 
-    private var pendingLaunchPkg: String? = null
-
-    override fun onActivityResult2(req: Int, res: Int, data: Intent?) {} // dummy
-
-    private fun launchNow(pkg: String, projData: Intent) {
-        val svc = Intent(this, OverlayService::class.java).apply {
-            putExtra("proj_code", projData.getIntExtra("code", 0))
-            putExtra("proj_intent", projData)
+    override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+        super.onActivityResult(req, res, data)
+        if (req == REQ_MEDIA_PROJ) {
+            val pkg = pendingLaunchPkg
+            pendingLaunchPkg = null
+            if (res == RESULT_OK && data != null && pkg != null) {
+                launchNow(pkg, res, data)
+            } else if (res == RESULT_OK && data != null) {
+                Toast.makeText(this, "Đã cấp Screen Capture (test OK)", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "Hủy cấp Screen Capture", Toast.LENGTH_SHORT).show()
+            }
         }
-        startForegroundService(svc)
+    }
+
+    private fun launchNow(pkg: String, resultCode: Int, projData: Intent) {
         try {
+            val svc = Intent(this, OverlayService::class.java).apply {
+                putExtra("proj_result_code", resultCode)
+                putExtra("proj_data", projData)
+            }
+            startForegroundService(svc)
+
             val i = packageManager.getLaunchIntentForPackage(pkg)
             if (i != null) {
                 i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 startActivity(i)
                 moveTaskToBack(true)
+            } else {
+                Toast.makeText(this, "Không mở được $pkg", Toast.LENGTH_SHORT).show()
             }
         } catch (e: Throwable) {
-            Toast.makeText(this, "Lỗi mở: ${e.message}", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Lỗi: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 

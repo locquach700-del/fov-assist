@@ -32,7 +32,6 @@ class OverlayService : Service() {
     private var sensitivity = 1.0f
     private var aimTapDelayMs = 60L
 
-    // MediaProjection
     private var projection: MediaProjection? = null
     private var vDisplay: VirtualDisplay? = null
     private var imgReader: ImageReader? = null
@@ -40,15 +39,16 @@ class OverlayService : Service() {
     private var screenH = 1920
     private var screenDpi = 320
 
-    // CV state
     private val frameLock = Object()
     private var latestBitmap: Bitmap? = null
     private var latestTarget: PointF? = null
     @Volatile private var detections = 0
 
-    // Aim loop
     private val aimThreadRunning = AtomicBoolean(false)
     private var aimThread: Thread? = null
+
+    private val uiHandler by lazy { Handler(Looper.getMainLooper()) }
+    private val cvHandler by lazy { Handler(Looper.getMainLooper()) }
 
     companion object {
         const val CH_ID = "fov_service"
@@ -71,12 +71,16 @@ class OverlayService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        intent?.let {
-            val data = if (Build.VERSION.SDK_INT >= 33)
-                it.getParcelableExtra("proj_intent", Intent::class.java)
-            else @Suppress("DEPRECATION") it.getParcelableExtra("proj_intent")
-            val code = it.getIntExtra("proj_code", 0)
-            if (data != null) startProjection(code, data)
+        if (intent != null) {
+            val resultCode = intent.getIntExtra("proj_result_code", Int.MIN_VALUE)
+            val projData: Intent? = if (Build.VERSION.SDK_INT >= 33) {
+                intent.getParcelableExtra("proj_data", Intent::class.java)
+            } else {
+                @Suppress("DEPRECATION") intent.getParcelableExtra("proj_data")
+            }
+            if (projData != null && resultCode == Activity.RESULT_OK) {
+                startProjection(resultCode, projData)
+            }
         }
         return START_STICKY
     }
@@ -94,17 +98,17 @@ class OverlayService : Service() {
             .build()
     }
 
-    private fun startProjection(code: Int, data: Intent) {
+    private fun startProjection(resultCode: Int, data: Intent) {
         try {
             val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            projection = mgr.getMediaProjection(code, data)
+            projection = mgr.getMediaProjection(resultCode, data)
             imgReader = ImageReader.newInstance(screenW, screenH, PixelFormat.RGBA_8888, 2)
             imgReader?.setOnImageAvailableListener({ reader ->
                 val img: Image? = try { reader.acquireLatestImage() } catch (_: Throwable) { null }
-                img?.use {
-                    processImage(it)
+                if (img != null) {
+                    try { processImage(img) } finally { try { img.close() } catch (_: Throwable) {} }
                 }
-            }, Handler(Looper.getMainLooper()))
+            }, cvHandler)
             vDisplay = projection?.createVirtualDisplay(
                 "fov_cap", screenW, screenH, screenDpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
@@ -122,12 +126,10 @@ class OverlayService : Service() {
             val pixelStride = plane.pixelStride
             val rowStride = plane.rowStride
             val rowPadding = rowStride - pixelStride * screenW
-            val bmp = Bitmap.createBitmap(
-                screenW + rowPadding / pixelStride, screenH, Bitmap.Config.ARGB_8888
-            )
+            val bmpW = screenW + rowPadding / pixelStride
+            val bmp = Bitmap.createBitmap(bmpW, screenH, Bitmap.Config.ARGB_8888)
             bmp.copyPixelsFromBuffer(buf)
 
-            // Detect
             val target = detectTarget(bmp)
             synchronized(frameLock) {
                 latestBitmap?.recycle()
@@ -137,21 +139,20 @@ class OverlayService : Service() {
         } catch (_: Throwable) {}
     }
 
-    // ===== CV DETECT =====
-    // Quét vùng FOV quanh crosshair, tìm pixel da/đỏ
     private fun detectTarget(bmp: Bitmap): PointF? {
         val fovR = fovView?.radius ?: 200f
         val ccx = fovView?.cx ?: (screenW / 2f)
         val ccy = fovView?.cy ?: (screenH / 2f)
-        val step = 8
+        val step = 6
         val left = (ccx - fovR).toInt().coerceAtLeast(0)
         val top = (ccy - fovR).toInt().coerceAtLeast(0)
-        val right = (ccx + fovR).toInt().coerceAtMost(screenW - 1)
-        val bottom = (ccy + fovR).toInt().coerceAtMost(screenH - 1)
+        val right = (ccx + fovR).toInt().coerceAtMost(minOf(screenW, bmp.width) - 1)
+        val bottom = (ccy + fovR).toInt().coerceAtMost(minOf(screenH, bmp.height) - 1)
         if (right <= left || bottom <= top) return null
 
-        var sx = 0.0; var sy = 0.0; var n = 0
-        detections = 0
+        var sx = 0.0
+        var sy = 0.0
+        var n = 0
 
         var y = top
         while (y < bottom) {
@@ -161,12 +162,18 @@ class OverlayService : Service() {
                 val r = (c shr 16) and 0xFF
                 val g = (c shr 8) and 0xFF
                 val b = c and 0xFF
-                // Filter 1: skin tone (đa dạng da người)
-                val isSkin = r > 90 && r > g && g > b && r - g > 12 && r - b > 20
-                // Filter 2: red nametag
-                val isRed = r > 170 && g < 80 && b < 80
-                if (isSkin || isRed) {
-                    sx += x; sy += y; n++
+
+                // Skin tone (FF character)
+                val isSkin = r > 100 && r > g && g >= b && r - g > 12 && r - b > 22
+                // Red nametag (FF enemy name)
+                val isRed = r > 175 && g < 90 && b < 90 && r - g > 90
+                // Saturated red (health bar địch)
+                val isRed2 = r > 140 && r > g * 2 && r > b * 2
+
+                if (isSkin || isRed || isRed2) {
+                    sx += x
+                    sy += y
+                    n++
                 }
                 x += step
             }
@@ -174,13 +181,15 @@ class OverlayService : Service() {
         }
 
         detections = n
-        if (n < 12) return null
+        if (n < 15) return null
         return PointF((sx / n).toFloat(), (sy / n).toFloat())
     }
 
-    // ===== AIM LOOP =====
     private fun startAimLoop() {
-        if (!ensureShizuku()) { Toast.makeText(this, "Chưa cấp Shizuku", Toast.LENGTH_SHORT).show(); return }
+        if (!ensureShizuku()) {
+            Toast.makeText(this, "Chưa cấp Shizuku", Toast.LENGTH_SHORT).show()
+            return
+        }
         aimOn = true
         aimThreadRunning.set(true)
         aimThread = Thread {
@@ -194,21 +203,21 @@ class OverlayService : Service() {
                         val dx = target!!.x - ccx
                         val dy = target!!.y - ccy
                         val dist = kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
-                        if (dist > 15f) {
-                            // Swipe camera từ giữa màn hình (vùng aim FF)
+                        if (dist > 20f) {
+                            // Swipe từ góc trái dưới (vùng joystick aim của FF là nửa phải)
                             val startX = (screenW * 0.85f).toInt()
                             val startY = (screenH * 0.5f).toInt()
-                            val endX = (startX + dx * sensitivity).toInt()
-                            val endY = (startY + dy * sensitivity).toInt()
+                            val endX = (startX + dx * sensitivity).toInt().coerceIn(0, screenW - 1)
+                            val endY = (startY + dy * sensitivity).toInt().coerceIn(0, screenH - 1)
                             shizukuExec("input", "swipe",
                                 startX.toString(), startY.toString(),
-                                endX.toString(), endY.toString(),
-                                "40")
+                                endX.toString(), endY.toString(), "40")
                         }
                     }
                     Thread.sleep(aimTapDelayMs)
-                } catch (_: InterruptedException) { break }
-                catch (_: Throwable) {}
+                } catch (_: InterruptedException) {
+                    break
+                } catch (_: Throwable) {}
             }
         }.also { it.start() }
     }
@@ -242,7 +251,8 @@ class OverlayService : Service() {
         } catch (_: Throwable) {
             return try {
                 val p = Runtime.getRuntime().exec(cmd.toList().toTypedArray())
-                p.waitFor(); true
+                p.waitFor()
+                true
             } catch (_: Throwable) { false }
         }
     }
@@ -286,86 +296,94 @@ class OverlayService : Service() {
         }
         root.addView(header)
 
-        // FOV radius
         val sizeLbl = TextView(ctx).apply {
-            setTextColor(0xFFDDDDDD.toInt()); textSize = 11f
-            text = "Bán kính FOV: 200px"
+            setTextColor(0xFFDDDDDD.toInt())
+            textSize = 11f
+            text = "FOV radius: 200px"
         }
         root.addView(sizeLbl)
         root.addView(SeekBar(ctx).apply {
-            max = 500; progress = 200
+            max = 500
+            progress = 200
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, f: Boolean) {
-                    fovView?.radius = p.toFloat(); fovView?.invalidate()
-                    sizeLbl.text = "Bán kính FOV: ${p}px"
+                    fovView?.radius = p.toFloat()
+                    fovView?.invalidate()
+                    sizeLbl.text = "FOV radius: ${p}px"
                 }
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) {}
             })
         })
 
-        // Crosshair X
         val cxLbl = TextView(ctx).apply {
-            setTextColor(0xFFDDDDDD.toInt()); textSize = 11f
-            text = "Crosshair X: ${screenW/2}"
+            setTextColor(0xFFDDDDDD.toInt())
+            textSize = 11f
+            text = "Cross X: ${screenW / 2}"
         }
         root.addView(cxLbl)
         root.addView(SeekBar(ctx).apply {
-            max = screenW; progress = screenW/2
+            max = screenW
+            progress = screenW / 2
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, f: Boolean) {
-                    fovView?.cx = p.toFloat(); fovView?.invalidate()
-                    cxLbl.text = "Crosshair X: $p"
+                    fovView?.cx = p.toFloat()
+                    fovView?.invalidate()
+                    cxLbl.text = "Cross X: $p"
                 }
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) {}
             })
         })
 
-        // Crosshair Y
         val cyLbl = TextView(ctx).apply {
-            setTextColor(0xFFDDDDDD.toInt()); textSize = 11f
-            text = "Crosshair Y: ${screenH/2}"
+            setTextColor(0xFFDDDDDD.toInt())
+            textSize = 11f
+            text = "Cross Y: ${screenH / 2}"
         }
         root.addView(cyLbl)
         root.addView(SeekBar(ctx).apply {
-            max = screenH; progress = screenH/2
+            max = screenH
+            progress = screenH / 2
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, f: Boolean) {
-                    fovView?.cy = p.toFloat(); fovView?.invalidate()
-                    cyLbl.text = "Crosshair Y: $p"
+                    fovView?.cy = p.toFloat()
+                    fovView?.invalidate()
+                    cyLbl.text = "Cross Y: $p"
                 }
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) {}
             })
         })
 
-        // Sensitivity
         val sensLbl = TextView(ctx).apply {
-            setTextColor(0xFFDDDDDD.toInt()); textSize = 11f
+            setTextColor(0xFFDDDDDD.toInt())
+            textSize = 11f
             text = "Sensitivity: 1.0x"
         }
         root.addView(sensLbl)
         root.addView(SeekBar(ctx).apply {
-            max = 30; progress = 10
+            max = 30
+            progress = 10
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, f: Boolean) {
                     sensitivity = p / 10f
-                    sensLbl.text = "Sensitivity: %.1fx".format(sensitivity)
+                    sensLbl.text = "Sensitivity: ${"%.1f".format(sensitivity)}x"
                 }
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) {}
             })
         })
 
-        // Aim delay
         val delayLbl = TextView(ctx).apply {
-            setTextColor(0xFFDDDDDD.toInt()); textSize = 11f
+            setTextColor(0xFFDDDDDD.toInt())
+            textSize = 11f
             text = "Aim delay: 60ms"
         }
         root.addView(delayLbl)
         root.addView(SeekBar(ctx).apply {
-            max = 200; progress = 60
+            max = 200
+            progress = 60
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, f: Boolean) {
                     aimTapDelayMs = p.toLong().coerceAtLeast(30)
@@ -398,19 +416,19 @@ class OverlayService : Service() {
         root.addView(aimBtn)
 
         val detLbl = TextView(ctx).apply {
-            setTextColor(0xFFAAAAAA.toInt()); textSize = 10f
+            setTextColor(0xFFAAAAAA.toInt())
+            textSize = 10f
             text = "Detect: 0 px"
         }
         root.addView(detLbl)
-        // Update detection count every 500ms
-        val h = Handler(Looper.getMainLooper())
+
         val updater = object : Runnable {
             override fun run() {
-                detLbl.text = "Detect: $detections px"
-                h.postDelayed(this, 500)
+                detLbl.text = "Detect: $detections px  |  Target: ${latestTarget?.let { "(${it.x.toInt()},${it.y.toInt()})" } ?: "none"}"
+                uiHandler.postDelayed(this, 500)
             }
         }
-        h.post(updater)
+        uiHandler.post(updater)
 
         root.addView(Button(ctx).apply {
             text = "Ẩn menu"
@@ -425,17 +443,25 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT)
         p.gravity = Gravity.TOP or Gravity.START
-        p.x = 20; p.y = 200
+        p.x = 20
+        p.y = 200
         wm.addView(root, p)
         menuView = root
 
-        var dx = 0; var dy = 0
+        var dx = 0
+        var dy = 0
         header.setOnTouchListener { _, e ->
             when (e.action) {
-                MotionEvent.ACTION_DOWN -> { dx = e.rawX.toInt() - p.x; dy = e.rawY.toInt() - p.y; true }
+                MotionEvent.ACTION_DOWN -> {
+                    dx = e.rawX.toInt() - p.x
+                    dy = e.rawY.toInt() - p.y
+                    true
+                }
                 MotionEvent.ACTION_MOVE -> {
-                    p.x = e.rawX.toInt() - dx; p.y = e.rawY.toInt() - dy
-                    wm.updateViewLayout(root, p); true
+                    p.x = e.rawX.toInt() - dx
+                    p.y = e.rawY.toInt() - dy
+                    wm.updateViewLayout(root, p)
+                    true
                 }
                 else -> false
             }
@@ -448,7 +474,10 @@ class OverlayService : Service() {
         try { vDisplay?.release() } catch (_: Throwable) {}
         try { imgReader?.close() } catch (_: Throwable) {}
         try { projection?.stop() } catch (_: Throwable) {}
-        synchronized(frameLock) { latestBitmap?.recycle(); latestBitmap = null }
+        synchronized(frameLock) {
+            latestBitmap?.recycle()
+            latestBitmap = null
+        }
         menuView?.let { runCatching { wm.removeView(it) } }
         fovView?.let { runCatching { wm.removeView(it) } }
     }
@@ -462,16 +491,23 @@ class FovView(ctx: Context) : View(ctx) {
     var crosshair = true
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE; strokeWidth = 4f; color = 0xFF00FF88.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
+        color = 0xFF00FF88.toInt()
     }
     private val cross = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE; strokeWidth = 2f; color = 0xFFFF4488.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+        color = 0xFFFF4488.toInt()
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         if (!visible) return
-        if (cx == 0f) { cx = width / 2f; cy = height / 2f }
+        if (cx == 0f) {
+            cx = width / 2f
+            cy = height / 2f
+        }
         canvas.drawCircle(cx, cy, radius, paint)
         if (crosshair) {
             canvas.drawLine(cx - 18f, cy, cx + 18f, cy, cross)

@@ -3,6 +3,7 @@ package com.fov.assist
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.*
 import android.os.Build
 import android.os.IBinder
@@ -18,6 +19,11 @@ class OverlayService : Service() {
     private var autoTapThread: Thread? = null
     @Volatile private var autoTapOn = false
     private var tapDelayMs = 100L
+
+    // Aim tap thread (độc lập với auto tap)
+    private var aimTapThread: Thread? = null
+    @Volatile private var aimTapOn = false
+    private var aimTapDelayMs = 50L
 
     companion object {
         const val CH_ID = "fov_service"
@@ -75,102 +81,187 @@ class OverlayService : Service() {
         val root = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(0xE6101018.toInt())
-            setPadding(24, 16, 24, 16)
+            setPadding(20, 12, 20, 12)
         }
 
         val header = TextView(ctx).apply {
             text = "⚡ FOV Assist"
             setTextColor(0xFF6CCFFF.toInt())
-            textSize = 15f
+            textSize = 14f
             setTypeface(typeface, Typeface.BOLD)
-            setPadding(0, 0, 0, 12)
+            setPadding(0, 0, 0, 10)
         }
         root.addView(header)
 
+        // --- FOV controls ---
         val sizeLabel = TextView(ctx).apply {
             setTextColor(0xFFDDDDDD.toInt())
-            textSize = 12f
+            textSize = 11f
             text = "Bán kính: 200px"
         }
         root.addView(sizeLabel)
-
-        val seek = SeekBar(ctx).apply {
-            max = 700
-            progress = 200
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: SeekBar?, prog: Int, fromUser: Boolean) {
-                    fovView?.radius = prog.toFloat()
-                    fovView?.invalidate()
-                    sizeLabel.text = "Bán kính: ${prog}px"
-                }
-                override fun onStartTrackingTouch(sb: SeekBar?) {}
-                override fun onStopTrackingTouch(sb: SeekBar?) {}
-            })
-        }
-        root.addView(seek)
-
-        val circleToggle = ToggleButton(ctx).apply {
-            textOn = "FOV: ON"; textOff = "FOV: OFF"
-            isChecked = true
-            setOnCheckedChangeListener { _, checked ->
-                fovView?.visible = checked
-                fovView?.invalidate()
-            }
-        }
-        root.addView(circleToggle)
-
-        val crosshairToggle = ToggleButton(ctx).apply {
-            textOn = "Cross: ON"; textOff = "Cross: OFF"
-            isChecked = true
-            setOnCheckedChangeListener { _, checked ->
-                fovView?.crosshair = checked
-                fovView?.invalidate()
-            }
-        }
-        root.addView(crosshairToggle)
-
-        val autoTapToggle = ToggleButton(ctx).apply {
-            textOn = "Auto Tap: ON"; textOff = "Auto Tap: OFF"
-            setOnCheckedChangeListener { _, checked ->
-                if (checked) {
-                    val ok = ensureShizuku()
-                    if (!ok) {
-                        isChecked = false
-                        Toast.makeText(ctx, "Chưa cấp quyền Shizuku", Toast.LENGTH_SHORT).show()
-                    } else {
-                        startAutoTap()
-                    }
-                } else {
-                    stopAutoTap()
-                }
-            }
-        }
-        root.addView(autoTapToggle)
-
-        val delayLabel = TextView(ctx).apply {
-            setTextColor(0xFFDDDDDD.toInt())
-            textSize = 11f
-            text = "Tap delay: 100ms"
-        }
-        root.addView(delayLabel)
         root.addView(SeekBar(ctx).apply {
-            max = 500
-            progress = 100
+            max = 700; progress = 200
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, f: Boolean) {
-                    tapDelayMs = p.toLong().coerceAtLeast(20)
-                    delayLabel.text = "Tap delay: ${tapDelayMs}ms"
+                    fovView?.radius = p.toFloat()
+                    fovView?.invalidate()
+                    sizeLabel.text = "Bán kính: ${p}px"
                 }
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) {}
             })
         })
 
-        val closeBtn = Button(ctx).apply {
-            text = "Ẩn menu"
-            setOnClickListener { menuView?.visibility = View.GONE }
+        val toggleRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
         }
-        root.addView(closeBtn)
+        val circleToggle = ToggleButton(ctx).apply {
+            textOn = "FOV"; textOff = "FOV"
+            isChecked = true
+            setOnCheckedChangeListener { _, c ->
+                fovView?.visible = c; fovView?.invalidate()
+            }
+        }
+        val crossToggle = ToggleButton(ctx).apply {
+            textOn = "X"; textOff = "X"
+            isChecked = true
+            setOnCheckedChangeListener { _, c ->
+                fovView?.crosshair = c; fovView?.invalidate()
+            }
+        }
+        toggleRow.addView(circleToggle)
+        toggleRow.addView(crossToggle)
+        root.addView(toggleRow)
+
+        // --- Divider ---
+        root.addView(View(ctx).apply {
+            setBackgroundColor(0xFF333344.toInt())
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 2)
+            setPadding(0, 10, 0, 10)
+        })
+
+        // --- Aim Section ---
+        val aimLabel = TextView(ctx).apply {
+            text = "🎯 AIM"
+            setTextColor(0xFFFF6688.toInt())
+            textSize = 12f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 0, 0, 6)
+        }
+        root.addView(aimLabel)
+
+        val aimInfo = TextView(ctx).apply {
+            text = "Giữ nút AIM để bắn liên tục vào tâm"
+            setTextColor(0xFFAAAAAA.toInt())
+            textSize = 10f
+            setPadding(0, 0, 0, 6)
+        }
+        root.addView(aimInfo)
+
+        val aimTapBtn = Button(ctx).apply {
+            text = "🎯 AIM (giữ để bắn)"
+            textSize = 14f
+            setBackgroundColor(0xFF7C2A4A.toInt())
+            setTextColor(0xFFFFFFFF.toInt())
+            setOnTouchListener { _, e ->
+                when (e.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        if (!ensureShizuku()) {
+                            Toast.makeText(ctx, "Chưa cấp Shizuku", Toast.LENGTH_SHORT).show()
+                            false
+                        } else {
+                            startAimTap()
+                            true
+                        }
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        stopAimTap()
+                        true
+                    }
+                    else -> false
+                }
+            }
+        }
+        root.addView(aimTapBtn)
+
+        val aimDelayLabel = TextView(ctx).apply {
+            setTextColor(0xFFDDDDDD.toInt())
+            textSize = 10f
+            text = "Aim tap delay: 50ms"
+        }
+        root.addView(aimDelayLabel)
+        root.addView(SeekBar(ctx).apply {
+            max = 200; progress = 50
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, f: Boolean) {
+                    aimTapDelayMs = p.toLong().coerceAtLeast(20)
+                    aimDelayLabel.text = "Aim tap delay: ${aimTapDelayMs}ms"
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+        })
+
+        // --- Divider ---
+        root.addView(View(ctx).apply {
+            setBackgroundColor(0xFF333344.toInt())
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 2)
+            setPadding(0, 10, 0, 10)
+        })
+
+        // --- App Launcher ---
+        val appLabel = TextView(ctx).apply {
+            text = "🚀 GAME"
+            setTextColor(0xFF66CCFF.toInt())
+            textSize = 12f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 0, 0, 6)
+        }
+        root.addView(appLabel)
+
+        val currentAppTxt = TextView(ctx).apply {
+            setTextColor(0xFFAAAAAA.toInt())
+            textSize = 10f
+            setPadding(0, 0, 0, 6)
+            val prefs = getSharedPreferences(MainActivity.PREFS, Context.MODE_PRIVATE)
+            text = "Đích: " + (prefs.getString(MainActivity.KEY_TARGET_NAME, "chưa chọn"))
+        }
+        root.addView(currentAppTxt)
+
+        val launchBtn = Button(ctx).apply {
+            text = "▶ Vào game"
+            textSize = 13f
+            setBackgroundColor(0xFF2A7C4A.toInt())
+            setTextColor(0xFFFFFFFF.toInt())
+            setOnClickListener {
+                val prefs = getSharedPreferences(MainActivity.PREFS, Context.MODE_PRIVATE)
+                val pkg = prefs.getString(MainActivity.KEY_TARGET_PKG, null)
+                if (pkg == null) {
+                    Toast.makeText(ctx, "Chưa chọn app đích", Toast.LENGTH_SHORT).show()
+                } else {
+                    try {
+                        val i = packageManager.getLaunchIntentForPackage(pkg)
+                        if (i != null) {
+                            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            startActivity(i)
+                        } else {
+                            Toast.makeText(ctx, "Không tìm thấy app", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (e: Throwable) {
+                        Toast.makeText(ctx, "Lỗi: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+        root.addView(launchBtn)
+
+        // --- Hide menu ---
+        root.addView(Button(ctx).apply {
+            text = "Ẩn menu"
+            textSize = 11f
+            setOnClickListener { menuView?.visibility = View.GONE }
+        })
 
         val p = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -180,7 +271,7 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
         )
         p.gravity = Gravity.TOP or Gravity.START
-        p.x = 40; p.y = 250
+        p.x = 30; p.y = 200
         wm.addView(root, p)
         menuView = root
 
@@ -188,15 +279,11 @@ class OverlayService : Service() {
         header.setOnTouchListener { _, e ->
             when (e.action) {
                 MotionEvent.ACTION_DOWN -> {
-                    dx = e.rawX.toInt() - p.x
-                    dy = e.rawY.toInt() - p.y
-                    true
+                    dx = e.rawX.toInt() - p.x; dy = e.rawY.toInt() - p.y; true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    p.x = e.rawX.toInt() - dx
-                    p.y = e.rawY.toInt() - dy
-                    wm.updateViewLayout(root, p)
-                    true
+                    p.x = e.rawX.toInt() - dx; p.y = e.rawY.toInt() - dy
+                    wm.updateViewLayout(root, p); true
                 }
                 else -> false
             }
@@ -206,37 +293,32 @@ class OverlayService : Service() {
     private fun ensureShizuku(): Boolean {
         return try {
             if (Shizuku.isPreV11()) return false
-            if (Shizuku.checkSelfPermission() == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                return true
-            }
-            false
-        } catch (_: Throwable) {
-            false
-        }
+            if (!Shizuku.pingBinder()) return false
+            Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        } catch (_: Throwable) { false }
     }
 
-    private fun startAutoTap() {
-        if (autoTapOn) return
-        autoTapOn = true
-        autoTapThread = Thread {
+    private fun startAimTap() {
+        if (aimTapOn) return
+        aimTapOn = true
+        aimTapThread = Thread {
             val dm = resources.displayMetrics
             val cx = dm.widthPixels / 2
             val cy = dm.heightPixels / 2
-            while (autoTapOn) {
+            while (aimTapOn) {
                 shizukuExec("input", "tap", cx.toString(), cy.toString())
-                try { Thread.sleep(tapDelayMs) } catch (_: InterruptedException) { break }
+                try { Thread.sleep(aimTapDelayMs) } catch (_: InterruptedException) { break }
             }
         }.also { it.start() }
     }
 
-    private fun stopAutoTap() {
-        autoTapOn = false
-        autoTapThread?.interrupt()
-        autoTapThread = null
+    private fun stopAimTap() {
+        aimTapOn = false
+        aimTapThread?.interrupt()
+        aimTapThread = null
     }
 
     private fun shizukuExec(vararg cmd: String): Boolean {
-        // Reflection vào Shizuku.newProcess (private)
         try {
             val clazz = Class.forName("rikka.shizuku.Shizuku")
             val method = clazz.getDeclaredMethod(
@@ -251,20 +333,18 @@ class OverlayService : Service() {
             proc?.waitFor()
             return proc != null
         } catch (_: Throwable) {
-            // Fallback Runtime.exec
             return try {
                 val p = Runtime.getRuntime().exec(cmd.toList().toTypedArray())
                 p.waitFor()
                 true
-            } catch (_: Throwable) {
-                false
-            }
+            } catch (_: Throwable) { false }
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        stopAutoTap()
+        aimTapOn = false; aimTapThread?.interrupt(); aimTapThread = null
+        autoTapOn = false; autoTapThread?.interrupt(); autoTapThread = null
         menuView?.let { runCatching { wm.removeView(it) } }
         fovView?.let { runCatching { wm.removeView(it) } }
     }
